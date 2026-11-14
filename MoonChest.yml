@@ -1,0 +1,963 @@
+name: Build MoonChest
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Create project files
+        run: |
+          mkdir -p build/src/main/java/ru/eclips/moonchest build/src/main/resources
+          cat > build/pom.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>ru.eclips</groupId>
+              <artifactId>MoonChest</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+              <build>
+                  <finalName>MoonChest-${project.version}</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          EOF_FILE
+          cat > build/src/main/resources/plugin.yml <<'EOF_FILE'
+          name: MoonChest
+          main: ru.eclips.moonchest.MoonChest
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: jaryshak
+          description: Event "Lunar chest" - hourly rarity chest with loot
+          softdepend: [EclipsClipItems, EclipsClips]
+
+          commands:
+            mwspawn:
+              description: Spawn a random chest at a random place now
+              usage: /mwspawn
+              permission: moonchest.admin
+            mys:
+              description: Spawn a chest of given rarity (1-5) at coords or at your position
+              usage: /mys <1-5> [x y z]
+              permission: moonchest.admin
+            mrd:
+              description: Spawn a chest of given rarity (1-5) at a random place
+              usage: /mrd <1-5>
+              permission: moonchest.admin
+            mt:
+              description: Reset chest timers so it can be opened now
+              usage: /mt
+              permission: moonchest.admin
+            mmenu:
+              description: Open the admin menu
+              usage: /mmenu
+              permission: moonchest.admin
+
+          permissions:
+            moonchest.admin:
+              description: Manage moon chests
+              default: op
+            moonchest.bypass:
+              description: Build near a moon chest
+              default: false
+          EOF_FILE
+          cat > build/src/main/resources/config.yml <<'EOF_FILE'
+          # MoonChest
+          # Шансы редкостей в % (по порядку: обычный, редкий, сверхредкий, эпический, легендарный). Сумма может быть любой.
+          chances: [50, 28, 14, 6, 2]
+          # Гарантия: после стольких часовых спавнов без легендарного следующий будет легендарным
+          pity-hours: 72
+          # Радиус спавна от координат 0,0 (основной мир)
+          radius: 3000
+          # Макс. высота сундука
+          max-height: 150
+          # Радиус запрета строительства вокруг сундука
+          protect-radius: 10
+          # Через сколько секунд после появления сундук открывается
+          open-after-seconds: 300
+          # Через сколько секунд после появления сундук исчезает
+          lifetime-seconds: 600
+          EOF_FILE
+          cat > build/src/main/java/ru/eclips/moonchest/MoonChest.java <<'EOF_FILE'
+          package ru.eclips.moonchest;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.block.BlockLeaves;
+          import cn.nukkit.block.BlockLiquid;
+          import cn.nukkit.blockentity.BlockEntity;
+          import cn.nukkit.blockentity.BlockEntityChest;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.block.BlockBreakEvent;
+          import cn.nukkit.event.block.BlockBurnEvent;
+          import cn.nukkit.event.block.BlockPlaceEvent;
+          import cn.nukkit.event.entity.EntityExplodeEvent;
+          import cn.nukkit.event.player.PlayerBucketEmptyEvent;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.event.player.PlayerInteractEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.response.FormResponseSimple;
+          import cn.nukkit.form.window.FormWindowSimple;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.item.enchantment.Enchantment;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.particle.FloatingTextParticle;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.nbt.tag.CompoundTag;
+          import cn.nukkit.plugin.Plugin;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.Config;
+
+          import java.io.File;
+          import java.lang.reflect.Method;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.UUID;
+          import java.util.concurrent.ThreadLocalRandom;
+
+          /**
+           * MoonChest: событие "Лунный сундук".
+           * Раз в час в XX:00 в основном мире появляется закрытый сундук с лутом по редкости.
+           * Команды (moonchest.admin): /mwspawn, /mys, /mrd, /mt, /mmenu
+           */
+          public class MoonChest extends PluginBase implements Listener {
+
+              static final String PERM = "moonchest.admin";
+              static final String BYPASS = "moonchest.bypass";
+              static final String PREFIX = "§e[Лунный сундук]§r ";
+              static final String[] NAMES = {"Обычный", "Редкий", "Сверхредкий", "Эпический", "Легендарный"};
+              // зелёный, оранжевый (§6), фиолетовый, красный, золотой (жирный §g, жёлто-золотой, отличается от оранжевого)
+              static final String[] COLORS = {"§a", "§6", "§5", "§c", "§l§g"};
+
+              // ---- настройки (config.yml)
+              private double[] chances = {50, 28, 14, 6, 2};
+              private int pityHours = 72;
+              private int radius = 3000;
+              private int maxY = 150;
+              private int protectRadius = 10;
+              private long openAfterMs = 300_000L;
+              private long lifetimeMs = 600_000L;
+
+              private Config data;
+              private int sinceLegendary = 0;
+              private long lastHour = -1;
+
+              static class ChestInfo {
+                  Level level;
+                  int x, y, z;
+                  int rarity;
+                  long openAt, endAt;
+                  boolean announcedOpen;
+                  FloatingTextParticle text;
+              }
+
+              static class Pending {
+                  int id;
+                  int kind; // 0 меню, 1 редкость(случайное место), 2 редкость(здесь), 3 список
+              }
+
+              private final List<ChestInfo> chests = new ArrayList<>();
+              private final Map<UUID, Pending> forms = new HashMap<>();
+              private final Map<UUID, Long> lastMsg = new HashMap<>();
+
+              // ------------------------------------------------------------------ жизненный цикл
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  try {
+                      List<Integer> ch = getConfig().getIntegerList("chances");
+                      if (ch != null && ch.size() == 5) {
+                          for (int i = 0; i < 5; i++) chances[i] = Math.max(0, ch.get(i));
+                      }
+                      pityHours = Math.max(1, getConfig().getInt("pity-hours", 72));
+                      radius = Math.max(50, getConfig().getInt("radius", 3000));
+                      maxY = getConfig().getInt("max-height", 150);
+                      protectRadius = Math.max(1, getConfig().getInt("protect-radius", 10));
+                      openAfterMs = Math.max(1, getConfig().getInt("open-after-seconds", 300)) * 1000L;
+                      lifetimeMs = Math.max(2, getConfig().getInt("lifetime-seconds", 600)) * 1000L;
+                  } catch (Throwable t) {
+                      getLogger().error("Не удалось прочитать config.yml: " + t);
+                  }
+
+                  getDataFolder().mkdirs();
+                  data = new Config(new File(getDataFolder(), "data.yml"), Config.YAML);
+                  sinceLegendary = data.getInt("since-legendary", 0);
+
+                  getServer().getPluginManager().registerEvents(this, this);
+                  lastHour = System.currentTimeMillis() / 3_600_000L;
+
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          try {
+                              tickSecond();
+                          } catch (Throwable t) {
+                              getLogger().error("Ошибка в тике MoonChest: " + t);
+                          }
+                      }
+                  }, 20);
+
+                  // убрать сундуки, оставшиеся после падения сервера
+                  getServer().getScheduler().scheduleDelayedTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          cleanupOrphans();
+                      }
+                  }, 100);
+
+                  getLogger().info("MoonChest включён. Шансы: " + java.util.Arrays.toString(chances) + ", pity " + pityHours + " спавнов");
+                  if (getServer().getPluginManager().getPlugin("EclipsClipItems") == null) {
+                      getLogger().warning("EclipsClipItems не найден: клипсы в сундуках выдаваться не будут.");
+                  }
+              }
+
+              @Override
+              public void onDisable() {
+                  for (ChestInfo c : new ArrayList<>(chests)) removeChest(c);
+                  chests.clear();
+                  saveActive();
+              }
+
+              // ------------------------------------------------------------------ тик
+
+              private void tickSecond() {
+                  long now = System.currentTimeMillis();
+                  long hourKey = now / 3_600_000L;
+                  if (hourKey != lastHour) {
+                      lastHour = hourKey;
+                      scheduledSpawn();
+                  }
+
+                  boolean changed = false;
+                  Iterator<ChestInfo> it = chests.iterator();
+                  while (it.hasNext()) {
+                      ChestInfo c = it.next();
+                      if (now >= c.endAt) {
+                          removeChest(c);
+                          it.remove();
+                          changed = true;
+                          continue;
+                      }
+                      if (!c.announcedOpen && now >= c.openAt) {
+                          c.announcedOpen = true;
+                          getServer().broadcastMessage(PREFIX + "Лунный сундук (" + COLORS[c.rarity] + NAMES[c.rarity]
+                                  + "§r) §aоткрыт§r! Координаты: §f" + c.x + " " + c.y + " " + c.z);
+                      }
+                      updateText(c, now);
+                  }
+                  if (changed) saveActive();
+              }
+
+              private void updateText(ChestInfo c, long now) {
+                  if (c.text == null) return;
+                  String line1 = COLORS[c.rarity] + "§l" + NAMES[c.rarity] + " лунный сундук";
+                  String line2;
+                  if (now < c.openAt) line2 = "§fДо открытия: " + mmss(c.openAt - now);
+                  else line2 = "§fИсчезнет через: " + mmss(c.endAt - now);
+                  c.text.setTitle(line1 + "\n" + line2);
+                  c.level.addParticle(c.text);
+              }
+
+              private static String mmss(long ms) {
+                  long s = Math.max(0, (ms + 999) / 1000);
+                  return String.format("%02d:%02d", s / 60, s % 60);
+              }
+
+              // ------------------------------------------------------------------ спавн
+
+              private void scheduledSpawn() {
+                  if (getServer().getOnlinePlayers().isEmpty()) return;
+                  int r;
+                  if (sinceLegendary >= pityHours) r = 4;
+                  else r = weighted();
+                  if (r == 4) sinceLegendary = 0;
+                  else sinceLegendary++;
+                  data.set("since-legendary", sinceLegendary);
+                  data.save();
+                  spawnRandom(r);
+              }
+
+              private int weighted() {
+                  double sum = 0;
+                  for (double d : chances) sum += d;
+                  if (sum <= 0) return 0;
+                  double x = ThreadLocalRandom.current().nextDouble() * sum;
+                  for (int i = 0; i < 5; i++) {
+                      x -= chances[i];
+                      if (x < 0) return i;
+                  }
+                  return 4;
+              }
+
+              /** Спавн в случайном месте основного мира. null если место не нашлось. */
+              private ChestInfo spawnRandom(int rarity) {
+                  Level lv = getServer().getDefaultLevel();
+                  if (lv == null) return null;
+                  int[] pos = findLocation(lv);
+                  if (pos == null) {
+                      getLogger().warning("Не нашёл подходящее место для сундука за 40 попыток");
+                      return null;
+                  }
+                  return spawn(lv, pos[0], pos[1], pos[2], rarity);
+              }
+
+              /** Возвращает {x, y, z} места под сундук (y = блок, где стоит сундук) или null. */
+              private int[] findLocation(Level lv) {
+                  ThreadLocalRandom R = ThreadLocalRandom.current();
+                  for (int attempt = 0; attempt < 40; attempt++) {
+                      double ang = R.nextDouble() * Math.PI * 2;
+                      double rad = radius * Math.sqrt(R.nextDouble());
+                      int x = (int) Math.round(Math.cos(ang) * rad);
+                      int z = (int) Math.round(Math.sin(ang) * rad);
+                      try {
+                          lv.loadChunk(x >> 4, z >> 4, true);
+                          Block ground = null;
+                          for (int y = 255; y >= 1; y--) {
+                              if (lv.getBlockIdAt(x, y, z) == 0) continue;
+                              Block b = lv.getBlock(x, y, z);
+                              if (b.canBeReplaced() && !(b instanceof BlockLiquid)) continue; // трава, цветы, снег
+                              ground = b;
+                              break;
+                          }
+                          if (ground == null) continue;
+                          int gy = ground.getFloorY();
+                          if (gy + 1 > maxY || gy < 1) continue; // выше лимита; всё что выше земли - открытое небо
+                          if (ground instanceof BlockLiquid || ground instanceof BlockLeaves || !ground.isSolid()) continue;
+                          String nm = ground.getName().toLowerCase(Locale.ROOT);
+                          if (nm.contains("ice") || nm.contains("magma") || nm.contains("cactus") || nm.contains("lava")
+                                  || nm.contains("water") || nm.contains("fire") || nm.contains("leaves") || nm.contains("vine")) continue;
+                          return new int[]{x, gy + 1, z};
+                      } catch (Throwable t) {
+                          getLogger().warning("Ошибка поиска места: " + t);
+                      }
+                  }
+                  return null;
+              }
+
+              /** Ставит сундук, наполняет лутом, объявляет в чате. */
+              ChestInfo spawn(Level lv, int x, int y, int z, int rarity) {
+                  try {
+                      Vector3 pos = new Vector3(x, y, z);
+                      lv.loadChunk(x >> 4, z >> 4, true);
+                      lv.setBlock(pos, Block.get(Block.CHEST), true, true);
+                      BlockEntity be = lv.getBlockEntity(pos);
+                      if (!(be instanceof BlockEntityChest)) {
+                          CompoundTag nbt = new CompoundTag()
+                                  .putString("id", BlockEntity.CHEST)
+                                  .putInt("x", x).putInt("y", y).putInt("z", z);
+                          be = BlockEntity.createBlockEntity(BlockEntity.CHEST, lv.getChunk(x >> 4, z >> 4, true), nbt);
+                      }
+                      if (!(be instanceof BlockEntityChest)) {
+                          getLogger().error("Не удалось создать BlockEntity сундука");
+                          lv.setBlock(pos, Block.get(Block.AIR), true, true);
+                          return null;
+                      }
+                      BlockEntityChest ch = (BlockEntityChest) be;
+                      try {
+                          ch.setName(COLORS[rarity] + "Лунный сундук");
+                      } catch (Throwable ignored) {
+                      }
+
+                      List<Item> loot = loot(rarity);
+                      List<Integer> slots = new ArrayList<>();
+                      for (int i = 0; i < 27; i++) slots.add(i);
+                      Collections.shuffle(slots);
+                      var inv = ch.getInventory();
+                      inv.clearAll();
+                      for (int i = 0; i < loot.size() && i < slots.size(); i++) {
+                          inv.setItem(slots.get(i), loot.get(i));
+                      }
+
+                      ChestInfo c = new ChestInfo();
+                      c.level = lv;
+                      c.x = x;
+                      c.y = y;
+                      c.z = z;
+                      c.rarity = rarity;
+                      long now = System.currentTimeMillis();
+                      c.openAt = now + openAfterMs;
+                      c.endAt = now + lifetimeMs;
+                      c.text = new FloatingTextParticle(new Vector3(x + 0.5, y + 1.6, z + 0.5), "", "");
+                      chests.add(c);
+                      updateText(c, now);
+                      saveActive();
+
+                      getServer().broadcastMessage(PREFIX + "Появился лунный сундук, редкость: " + COLORS[rarity] + NAMES[rarity]
+                              + "§r, координаты: §f" + x + " " + y + " " + z);
+                      return c;
+                  } catch (Throwable t) {
+                      getLogger().error("Не удалось заспавнить сундук: " + t);
+                      t.printStackTrace();
+                      return null;
+                  }
+              }
+
+              private void removeChest(ChestInfo c) {
+                  try {
+                      Vector3 pos = new Vector3(c.x, c.y, c.z);
+                      BlockEntity be = c.level.getBlockEntity(pos);
+                      if (be instanceof BlockEntityChest) {
+                          var inv = ((BlockEntityChest) be).getInventory();
+                          for (Player p : new HashSet<>(inv.getViewers())) p.removeWindow(inv);
+                          inv.clearAll();
+                          be.close();
+                      }
+                      if (c.level.getBlockIdAt(c.x, c.y, c.z) == Block.CHEST) {
+                          c.level.setBlock(pos, Block.get(Block.AIR), true, true);
+                      }
+                  } catch (Throwable t) {
+                      getLogger().error("Ошибка удаления сундука: " + t);
+                  }
+                  try {
+                      if (c.text != null) {
+                          c.text.setInvisible(true);
+                          c.level.addParticle(c.text);
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private void saveActive() {
+                  try {
+                      List<String> l = new ArrayList<>();
+                      for (ChestInfo c : chests) l.add(c.level.getFolderName() + ";" + c.x + ";" + c.y + ";" + c.z);
+                      data.set("active", l);
+                      data.save();
+                  } catch (Throwable t) {
+                      getLogger().warning("Не удалось сохранить data.yml: " + t);
+                  }
+              }
+
+              private void cleanupOrphans() {
+                  try {
+                      for (String s : data.getStringList("active")) {
+                          String[] p = s.split(";");
+                          if (p.length != 4) continue;
+                          Level lv = getServer().getLevelByName(p[0]);
+                          if (lv == null) continue;
+                          int x = Integer.parseInt(p[1]), y = Integer.parseInt(p[2]), z = Integer.parseInt(p[3]);
+                          lv.loadChunk(x >> 4, z >> 4, false);
+                          if (lv.getBlockIdAt(x, y, z) == Block.CHEST) {
+                              BlockEntity be = lv.getBlockEntity(new Vector3(x, y, z));
+                              if (be instanceof BlockEntityChest) {
+                                  ((BlockEntityChest) be).getInventory().clearAll();
+                                  be.close();
+                              }
+                              lv.setBlock(new Vector3(x, y, z), Block.get(Block.AIR), true, true);
+                              getLogger().info("Удалён старый лунный сундук " + x + " " + y + " " + z);
+                          }
+                      }
+                  } catch (Throwable t) {
+                      getLogger().warning("Ошибка очистки старых сундуков: " + t);
+                  }
+                  data.set("active", new ArrayList<String>());
+                  data.save();
+              }
+
+              // ------------------------------------------------------------------ лут
+
+              private List<Item> loot(int r) {
+                  ThreadLocalRandom R = ThreadLocalRandom.current();
+                  List<Item> L = new ArrayList<>();
+                  switch (r) {
+                      case 0: { // Обычный
+                          addClip(L, R.nextBoolean() ? 50 : 100);
+                          stacks(L, "diamond", 264, rnd(2, 3));
+                          stacks(L, "golden_apple", 322, rnd(2, 3));
+                          armors(L, "diamond", rnd(2, 3), 1, 3);
+                          L.add(mk("netherite_sword", 743, 1));
+                          break;
+                      }
+                      case 1: { // Редкий
+                          addClip(L, 150);
+                          armors(L, "netherite", 2, 4, 4);
+                          L.add(sword(4));
+                          stacks(L, "golden_apple", 322, rnd(2, 5));
+                          break;
+                      }
+                      case 2: { // Сверхредкий
+                          addClip(L, R.nextInt(100) < 75 ? 200 : 500);
+                          armors(L, "netherite", rnd(3, 5), 1, 4);
+                          int swords = rnd(1, 2);
+                          for (int i = 0; i < swords; i++) L.add(sword(4));
+                          stacks(L, "ender_pearl", 368, rnd(1, 2));
+                          stacks(L, "golden_apple", 322, rnd(8, 20));
+                          break;
+                      }
+                      case 3: { // Эпический
+                          addClip(L, R.nextInt(100) < 75 ? 500 : 1000);
+                          armors(L, "netherite", rnd(3, 7), 4, 4);
+                          int swords = rnd(2, 3);
+                          for (int i = 0; i < swords; i++) L.add(sword(5));
+                          stacks(L, "golden_apple", 322, rnd(16, 32));
+                          stacks(L, "netherite_block", 525, rnd(2, 4));
+                          stacks(L, "enchanted_golden_apple", 466, rnd(2, 5));
+                          if (R.nextInt(100) < 50) L.add(elytra());
+                          break;
+                      }
+                      default: { // Легендарный
+                          addClip(L, 1000);
+                          if (R.nextInt(100) < 50) addClip(L, 500);
+                          armors(L, "netherite", rnd(1, 3), 5, 5);
+                          if (R.nextInt(100) < 75) L.add(sword(6));
+                          int swords = rnd(2, 4);
+                          for (int i = 0; i < swords; i++) L.add(sword(5));
+                          armors(L, "netherite", rnd(2, 4), 4, 4);
+                          stacks(L, "enchanted_golden_apple", 466, rnd(6, 10));
+                          L.add(elytra());
+                          Item pick = mk("netherite_pickaxe", 746, 1);
+                          ench(pick, Enchantment.ID_EFFICIENCY, 5);
+                          ench(pick, Enchantment.ID_DURABILITY, 3);
+                          L.add(pick);
+                          stacks(L, "golden_apple", 322, rnd(32, 64));
+                          if (R.nextInt(100) < 35) stacks(L, "netherite_block", 525, rnd(5, 8));
+                          break;
+                      }
+                  }
+                  return L;
+              }
+
+              private static int rnd(int a, int b) {
+                  return ThreadLocalRandom.current().nextInt(a, b + 1);
+              }
+
+              private static Item mk(String name, int fallbackId, int count) {
+                  Item it = null;
+                  try {
+                      it = Item.fromString(name);
+                  } catch (Throwable ignored) {
+                  }
+                  if (it == null || it.getId() == 0) it = Item.get(fallbackId, 0, count);
+                  it.setCount(count);
+                  return it;
+              }
+
+              private static void stacks(List<Item> L, String name, int id, int count) {
+                  while (count > 0) {
+                      int n = Math.min(64, count);
+                      L.add(mk(name, id, n));
+                      count -= n;
+                  }
+              }
+
+              private static void ench(Item it, int id, int lvl) {
+                  Enchantment e = Enchantment.getEnchantment(id);
+                  if (e != null) {
+                      e.setLevel(lvl, false);
+                      it.addEnchantment(e);
+                  }
+              }
+
+              private static Item sword(int sharp) {
+                  Item s = mk("netherite_sword", 743, 1);
+                  ench(s, Enchantment.ID_DAMAGE_ALL, sharp);
+                  return s;
+              }
+
+              private static Item elytra() {
+                  Item e = mk("elytra", 444, 1);
+                  ench(e, Enchantment.ID_MENDING, 1);
+                  ench(e, Enchantment.ID_DURABILITY, 3);
+                  return e;
+              }
+
+              /** count предметов брони (случайные части), защита от lo до hi. */
+              private static void armors(List<Item> L, String mat, int count, int lo, int hi) {
+                  String[] part = {"helmet", "chestplate", "leggings", "boots"};
+                  int[] idsN = {748, 749, 750, 751};
+                  int[] idsD = {310, 311, 312, 313};
+                  List<Integer> order = new ArrayList<>();
+                  while (order.size() < count) {
+                      List<Integer> bag = new ArrayList<>(List.of(0, 1, 2, 3));
+                      Collections.shuffle(bag);
+                      order.addAll(bag);
+                  }
+                  for (int i = 0; i < count; i++) {
+                      int p = order.get(i);
+                      Item it = mk(mat + "_" + part[p], mat.equals("netherite") ? idsN[p] : idsD[p], 1);
+                      ench(it, Enchantment.ID_PROTECTION_ALL, rnd(lo, hi));
+                      L.add(it);
+                  }
+              }
+
+              /** Предмет клипсов из плагина EclipsClipItems (через reflection). */
+              private void addClip(List<Item> L, int clips) {
+                  try {
+                      Plugin pl = getServer().getPluginManager().getPlugin("EclipsClipItems");
+                      if (pl == null) return;
+                      Class<?> cls = Class.forName("ru.eclips.clipitems.ClipItem", true, pl.getClass().getClassLoader());
+                      Method create = cls.getMethod("create", int.class);
+                      Method getClips = cls.getMethod("getClips");
+                      Item best = null;
+                      int bestDiff = Integer.MAX_VALUE;
+                      for (int i = 0; i < 6; i++) {
+                          Object o = create.invoke(null, i);
+                          if (!(o instanceof Item)) continue;
+                          int v = ((Number) getClips.invoke(o)).intValue();
+                          if (v == clips) {
+                              L.add((Item) o);
+                              return;
+                          }
+                          if (Math.abs(v - clips) < bestDiff) {
+                              bestDiff = Math.abs(v - clips);
+                              best = (Item) o;
+                          }
+                      }
+                      if (best != null) {
+                          getLogger().warning("В ClipItems нет предмета на " + clips + " клипсов, беру ближайший");
+                          L.add(best);
+                      }
+                  } catch (Throwable t) {
+                      getLogger().error("Не удалось создать предмет клипсов: " + t);
+                  }
+              }
+
+              // ------------------------------------------------------------------ защита
+
+              private ChestInfo at(Level lv, int x, int y, int z) {
+                  for (ChestInfo c : chests) {
+                      if (c.level == lv && c.x == x && c.y == y && c.z == z) return c;
+                  }
+                  return null;
+              }
+
+              private boolean near(Level lv, int x, int y, int z) {
+                  for (ChestInfo c : chests) {
+                      if (c.level != lv) continue;
+                      if (Math.abs(c.x - x) <= protectRadius && Math.abs(c.y - y) <= protectRadius && Math.abs(c.z - z) <= protectRadius) {
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              private void tell(Player p, String msg) {
+                  long now = System.currentTimeMillis();
+                  Long last = lastMsg.get(p.getUniqueId());
+                  if (last != null && now - last < 1500) return;
+                  lastMsg.put(p.getUniqueId(), now);
+                  p.sendMessage(PREFIX + msg);
+              }
+
+              @EventHandler
+              public void onInteract(PlayerInteractEvent e) {
+                  if (chests.isEmpty()) return;
+                  if (e.getAction() != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK) return;
+                  Block b = e.getBlock();
+                  if (b == null) return;
+                  ChestInfo c = at(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ());
+                  if (c == null) return;
+                  long now = System.currentTimeMillis();
+                  if (now < c.openAt) {
+                      e.setCancelled(true);
+                      tell(e.getPlayer(), "§cСундук закрыт. Откроется через §f" + mmss(c.openAt - now));
+                  }
+              }
+
+              @EventHandler
+              public void onBreak(BlockBreakEvent e) {
+                  if (chests.isEmpty()) return;
+                  Block b = e.getBlock();
+                  if (at(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ()) != null) {
+                      e.setCancelled(true);
+                      tell(e.getPlayer(), "§cЛунный сундук нельзя сломать, его можно только открыть.");
+                      return;
+                  }
+                  if (near(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ()) && !e.getPlayer().hasPermission(BYPASS)) {
+                      e.setCancelled(true);
+                      tell(e.getPlayer(), "§cРядом с лунным сундуком нельзя строить.");
+                  }
+              }
+
+              @EventHandler
+              public void onPlace(BlockPlaceEvent e) {
+                  if (chests.isEmpty()) return;
+                  Block b = e.getBlock();
+                  if (near(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ()) && !e.getPlayer().hasPermission(BYPASS)) {
+                      e.setCancelled(true);
+                      tell(e.getPlayer(), "§cРядом с лунным сундуком нельзя строить.");
+                  }
+              }
+
+              @EventHandler
+              public void onBucket(PlayerBucketEmptyEvent e) {
+                  if (chests.isEmpty()) return;
+                  Block b = e.getBlockClicked();
+                  if (b != null && near(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ()) && !e.getPlayer().hasPermission(BYPASS)) {
+                      e.setCancelled(true);
+                      tell(e.getPlayer(), "§cРядом с лунным сундуком нельзя строить.");
+                  }
+              }
+
+              @EventHandler
+              public void onBurn(BlockBurnEvent e) {
+                  Block b = e.getBlock();
+                  if (at(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ()) != null) e.setCancelled(true);
+              }
+
+              @EventHandler
+              public void onExplode(EntityExplodeEvent e) {
+                  if (chests.isEmpty()) return;
+                  List<Block> l = new ArrayList<>(e.getBlockList());
+                  l.removeIf(b -> at(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ()) != null);
+                  e.setBlockList(l);
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  lastMsg.remove(e.getPlayer().getUniqueId());
+                  forms.remove(e.getPlayer().getUniqueId());
+              }
+
+              // ------------------------------------------------------------------ команды
+
+              @Override
+              public boolean onCommand(CommandSender s, Command cmd, String label, String[] a) {
+                  String n = cmd.getName().toLowerCase(Locale.ROOT);
+                  if (!s.hasPermission(PERM)) {
+                      s.sendMessage(PREFIX + "§cНет прав.");
+                      return true;
+                  }
+                  switch (n) {
+                      case "mwspawn": {
+                          int r = weighted();
+                          ChestInfo c = spawnRandom(r);
+                          if (c == null) s.sendMessage(PREFIX + "§cНе удалось создать сундук.");
+                          return true;
+                      }
+                      case "mrd": {
+                          int r = a.length > 0 ? parseRarity(a[0]) : -1;
+                          if (r < 0) {
+                              s.sendMessage(PREFIX + "§cИспользование: /mrd <редкость 1-5>");
+                              return true;
+                          }
+                          if (spawnRandom(r) == null) s.sendMessage(PREFIX + "§cНе удалось создать сундук.");
+                          return true;
+                      }
+                      case "mys": {
+                          int r = a.length > 0 ? parseRarity(a[0]) : -1;
+                          if (r < 0 || !(a.length == 1 || a.length == 4)) {
+                              s.sendMessage(PREFIX + "§cИспользование: /mys <редкость 1-5> [x y z]");
+                              return true;
+                          }
+                          Level lv;
+                          int x, y, z;
+                          if (a.length == 4) {
+                              try {
+                                  x = (int) Math.floor(Double.parseDouble(a[1]));
+                                  y = (int) Math.floor(Double.parseDouble(a[2]));
+                                  z = (int) Math.floor(Double.parseDouble(a[3]));
+                              } catch (Exception ex) {
+                                  s.sendMessage(PREFIX + "§cКоординаты должны быть числами.");
+                                  return true;
+                              }
+                              lv = (s instanceof Player) ? ((Player) s).getLevel() : getServer().getDefaultLevel();
+                          } else {
+                              if (!(s instanceof Player)) {
+                                  s.sendMessage(PREFIX + "§cИз консоли укажите координаты: /mys <1-5> <x y z>");
+                                  return true;
+                              }
+                              Player p = (Player) s;
+                              lv = p.getLevel();
+                              x = p.getFloorX();
+                              y = p.getFloorY();
+                              z = p.getFloorZ();
+                          }
+                          if (lv == null || y < 0 || y > 255) {
+                              s.sendMessage(PREFIX + "§cНеверные координаты.");
+                              return true;
+                          }
+                          if (spawn(lv, x, y, z, r) == null) s.sendMessage(PREFIX + "§cНе удалось создать сундук.");
+                          return true;
+                      }
+                      case "mt": {
+                          resetTimers();
+                          s.sendMessage(PREFIX + "§aВремя сброшено: сундуки (" + chests.size() + ") можно открывать сейчас.");
+                          return true;
+                      }
+                      case "mmenu": {
+                          if (!(s instanceof Player)) {
+                              s.sendMessage(PREFIX + "§cМеню только для игроков.");
+                              return true;
+                          }
+                          openMenu((Player) s);
+                          return true;
+                      }
+                      default:
+                          return false;
+                  }
+              }
+
+              private static int parseRarity(String s) {
+                  try {
+                      int v = Integer.parseInt(s.trim());
+                      return (v >= 1 && v <= 5) ? v - 1 : -1;
+                  } catch (Exception e) {
+                      return -1;
+                  }
+              }
+
+              private void resetTimers() {
+                  long now = System.currentTimeMillis();
+                  for (ChestInfo c : chests) {
+                      c.openAt = now;
+                  }
+              }
+
+              // ------------------------------------------------------------------ меню
+
+              private void show(Player p, FormWindowSimple f, int kind) {
+                  Pending pd = new Pending();
+                  pd.kind = kind;
+                  pd.id = p.showFormWindow(f);
+                  forms.put(p.getUniqueId(), pd);
+              }
+
+              private void openMenu(Player p) {
+                  FormWindowSimple f = new FormWindowSimple("§l§eЛунный сундук", "Активных сундуков: §f" + chests.size());
+                  f.addButton(new ElementButton("Случайный сундук\n(случайное место и редкость)"));
+                  f.addButton(new ElementButton("Выбрать редкость\n(случайное место)"));
+                  f.addButton(new ElementButton("Выбрать редкость\n(здесь, где я стою)"));
+                  f.addButton(new ElementButton("Сбросить время\n(открыть сейчас)"));
+                  f.addButton(new ElementButton("Список активных сундуков"));
+                  f.addButton(new ElementButton("§cУдалить все сундуки"));
+                  show(p, f, 0);
+              }
+
+              private void openRarityMenu(Player p, int kind) {
+                  FormWindowSimple f = new FormWindowSimple("§l§eВыбор редкости", kind == 1 ? "Случайное место" : "Ваша позиция");
+                  for (int i = 0; i < 5; i++) f.addButton(new ElementButton(COLORS[i] + NAMES[i]));
+                  f.addButton(new ElementButton("Назад"));
+                  show(p, f, kind);
+              }
+
+              private void openList(Player p) {
+                  StringBuilder sb = new StringBuilder();
+                  long now = System.currentTimeMillis();
+                  if (chests.isEmpty()) sb.append("Активных сундуков нет.");
+                  for (ChestInfo c : chests) {
+                      sb.append(COLORS[c.rarity]).append(NAMES[c.rarity]).append("§r  ")
+                              .append(c.x).append(" ").append(c.y).append(" ").append(c.z).append("\n");
+                      if (now < c.openAt) sb.append("  до открытия ").append(mmss(c.openAt - now));
+                      else sb.append("  исчезнет через ").append(mmss(c.endAt - now));
+                      sb.append("\n\n");
+                  }
+                  FormWindowSimple f = new FormWindowSimple("§l§eАктивные сундуки", sb.toString());
+                  f.addButton(new ElementButton("Назад"));
+                  show(p, f, 3);
+              }
+
+              @EventHandler
+              public void onForm(PlayerFormRespondedEvent e) {
+                  Player p = e.getPlayer();
+                  Pending pd = forms.get(p.getUniqueId());
+                  if (pd == null || pd.id != e.getFormID()) return;
+                  forms.remove(p.getUniqueId());
+                  if (e.wasClosed() || !(e.getResponse() instanceof FormResponseSimple)) return;
+                  if (!p.hasPermission(PERM)) return;
+                  int b = ((FormResponseSimple) e.getResponse()).getClickedButtonId();
+
+                  switch (pd.kind) {
+                      case 0: {
+                          if (b == 0) {
+                              if (spawnRandom(weighted()) == null) p.sendMessage(PREFIX + "§cНе удалось создать сундук.");
+                          } else if (b == 1) {
+                              openRarityMenu(p, 1);
+                          } else if (b == 2) {
+                              openRarityMenu(p, 2);
+                          } else if (b == 3) {
+                              resetTimers();
+                              p.sendMessage(PREFIX + "§aВремя сброшено, сундуки можно открывать сейчас.");
+                          } else if (b == 4) {
+                              openList(p);
+                          } else if (b == 5) {
+                              int n = chests.size();
+                              for (ChestInfo c : new ArrayList<>(chests)) removeChest(c);
+                              chests.clear();
+                              saveActive();
+                              p.sendMessage(PREFIX + "§aУдалено сундуков: " + n);
+                          }
+                          break;
+                      }
+                      case 1:
+                      case 2: {
+                          if (b < 0 || b > 4) {
+                              openMenu(p);
+                              break;
+                          }
+                          if (pd.kind == 1) {
+                              if (spawnRandom(b) == null) p.sendMessage(PREFIX + "§cНе удалось создать сундук.");
+                          } else {
+                              if (spawn(p.getLevel(), p.getFloorX(), p.getFloorY(), p.getFloorZ(), b) == null) {
+                                  p.sendMessage(PREFIX + "§cНе удалось создать сундук.");
+                              }
+                          }
+                          break;
+                      }
+                      default:
+                          openMenu(p);
+                  }
+              }
+          }
+          EOF_FILE
+
+      - name: Build jar
+        run: mvn -B -f build/pom.xml package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoonChest
+          path: build/target/MoonChest-1.0.0.jar
